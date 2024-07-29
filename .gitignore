@@ -1,0 +1,12 @@
+.DS_Store
+.Rproj.user
+derivations/
+output/simulation_results
+*cache/
+20231012_untidied_steps.RDA
+predict_fold*
+*simResults*
+*unnamed-chunk*
+.gitkeep
+*Rdata
+*rda

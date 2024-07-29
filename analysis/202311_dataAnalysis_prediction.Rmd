@@ -1,0 +1,397 @@
+---
+title: "Data analysis figures and results for steps data"
+author: "Julia Wrobel"
+date: '`r format(Sys.time(), "%Y-%m-%d")`'
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+hitheme: tomorrow
+highlighter: highlight.js
+---
+
+# Overview
+
+This file loads produces Figures and runs analysis using the real data.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+library(viridis)
+library(splines)
+library(refund)
+library(Matrix)
+library(mvtnorm)
+library(patchwork)
+library(pracma)
+library(tictoc)
+library(vbvs.concurrent)
+library(fields)
+
+knitr::opts_chunk$set(echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 4,
+  fig.path = '../output/'
+)
+
+theme_set(theme_bw() + theme(legend.position = "bottom"))
+
+source(here::here("preprocessing", "estimate_flode.R"))
+source(here::here("preprocessing", "predict_flode.R"))
+source(here::here("preprocessing", "utils.R"))
+source(here::here("preprocessing", "search_alpha.R"))
+source(here::here("preprocessing", "make_pffr_pup.R"))
+```
+
+# Load paw data
+
+```{r data_import}
+load(here::here("data", "20231012_tidied_steps.RDA"))
+```
+
+
+
+# Analysis
+
+
+
+## data organization
+
+
+```{r}
+reseg = reseg %>%
+  mutate(int = 1) %>%
+  #filter(step <= 208) %>%
+  nest(data = c(-step)) %>%
+  mutate(trial = row_number()) %>% 
+  unnest(data) %>%
+  select(trial, int, time = index, 
+         value = p_up, v_up, bicep, tricep) %>%
+  group_by(trial) %>%
+  mutate(y0 = first(value))  %>%
+  ungroup() 
+  
+
+```
+
+
+
+```{r}
+# simulated_data = simulate_flode(I = 25, 
+# 																		D = 40, 
+# 																		sigma_y0 = 5, 
+# 																		sigma = 0.1, 
+# 																		alpha = 3, 
+# 																		rand_int = TRUE, 
+# 																		lambda0 = 20,
+# 																		seed = 12345)
+# 
+# reseg = simulated_data$data %>% 
+#   mutate(int = 1, bicep = x, 
+#          tricep = sin(time) + rnorm(1))
+```
+
+
+## Splitting data
+
+Here we run 10-fold cross validation with flode, fhist, and fconc to determine which model has the best predictive performance.
+
+```{r}
+# set up the folds
+set.seed(22334)
+folds = sample(1:10, size = length(unique(reseg$trial)),
+       replace = TRUE)
+
+reseg = reseg %>%
+  nest(data = c(-trial)) %>%
+  mutate(fold = folds) %>%
+  unnest(data)
+```
+
+## Cross-validation
+
+Set up functions for integrating fhist model.
+
+```{r}
+# fhist surfaces
+make_surface_fhist = function(fhist_surf, D = 100, label = ""){
+		## interpolate surface to get on same grid as flode
+		interp_obj = list(x = unique(fhist_surf$s), y = unique(fhist_surf$t),
+											z = matrix(fhist_surf$value, D, D, byrow = TRUE))
+		
+		t = s = seq(0, 1, length.out = D)
+		loc_mat = list(x = s, y = t)
+		surface = fields::interp.surface.grid(interp_obj, loc_mat)$z
+		surface[D,] = surface[D-1,] # carry last value forward so not NA
+		surface =	surface * lower.tri(surface, diag = TRUE) %>% as_tibble() 
+
+
+		surface %>% 
+		  mutate(t = t) %>%
+		  pivot_longer(V1:V100, names_to = "s", values_to = "value") %>%
+		  mutate(label = label,
+		         s = rep(seq(0, 1, length.out = D), 100)) 
+
+}
+
+integrate_surface = function(basis_time, surface, covar){
+  D = length(basis_time)
+  
+  beta_covar_f = function(s0, t0 = 1, basis_time, surface, covar){
+    filter(surface, s == s0, t == t0)$value * covar[which(basis_time == s0)] 
+  }
+  
+  Gstar = sapply(basis_time, FUN = function(t){cumtrapz(basis_time, beta_covar_f(basis_time, t, basis_time, surface,covar))[D,]})
+  return(t(Gstar))
+}
+
+```
+
+
+Set up function for doing cross-validation.
+
+```{r}
+do_cv = function(fold_num){
+    train = filter(reseg, fold != fold_num)
+    test = filter(reseg, fold == fold_num)
+  
+    predict_df = select(test, time, value, fold)
+  ######################################################################
+  ## run flode
+  ######################################################################
+    alpha_start_pUp = search_alpha(data = train, 
+														 forcing_functions = c("int",  "bicep", "tricep"),
+														 Kt = 20, 
+														 alpha_min = 1,
+														 alpha_max = 8)
+	
+	# run flode
+	flode_results = estimate_flode(train, 
+															alpha0 = alpha_start_pUp$best_alpha, 
+                            	Kt = 20,
+															forcing_functions = c("int", "bicep","tricep"),
+															max_iter = 50, 
+															tol = 0.001, 
+															initial_position = FALSE,
+															random_effects = TRUE)
+	
+	
+	# calculate cross-validated error
+	# also store alpha for each around as well as testing fold
+	predict_df$yhat_flode = predict_flode(flode_results, 
+	                                      test,
+	                                      forcing_functions = c("int", "bicep","tricep"))$yhat_flode
+	
+	######################################################################
+  ## run fhist
+  ######################################################################
+	
+	fhist_results = make_pffr_pUp(train, covar = c("bicep","tricep"),
+	                          random_int = TRUE)
+	
+	
+	xB_fhist = xB_fconc = matrix(NA, length(unique(test$trial)), 100)
+	grid = sort(unique(train$time))
+	
+	fhist_surf1 = coef(fhist_results$mod, n1 = 100, n2 = 100)$smterms$"ff(x1,s)"$coef %>%
+	  select(s = x1.smat, t = x1.tmat, value = value) %>% as_tibble() 
+	
+	fhist_surf2 = coef(fhist_results$mod, n1 = 100, n2 = 100)$smterms$"ff(x2,s)"$coef %>%
+	  select(s = x2.smat, t = x2.tmat, value = value) %>% as_tibble() 
+	
+	surface_bicep = make_surface_fhist(fhist_surf1, label = "bicep_fhist")
+	surface_tricep = make_surface_fhist(fhist_surf2, label = "tricep_fhist")
+	b0 = coef(fhist_results$mod)$pterms[1]
+	beta0_fhist = as.numeric(coef(fhist_results$mod, n1 = 100, n2 = 100)$smterms$"Intercept(t)"$coef$value)
+	
+	trials = unique(test$trial)
+	for(i in 1:length(trials)){
+	  bicep = filter(test, trial == trials[i])$bicep
+    tricep = filter(test, trial == trials[i])$tricep
+    xb_bicep = integrate_surface(grid, surface_bicep, covar = bicep) 
+    xb_tricep = integrate_surface(grid, surface_tricep, covar = tricep) 
+  
+    xB_fhist[i,] = b0 + beta0_fhist +
+      xb_bicep + xb_tricep
+    }
+	
+	predict_df$yhat_fhist = as.vector(t(xB_fhist))
+	
+	######################################################################
+  ## run fconc
+  ######################################################################
+	# 5 has an error
+	fconc_results = vb_concurrent(value ~ int + bicep + tricep | time, 
+	                              id.var = "trial",
+	                              data = train, 
+	                              Kt = 20,
+	                              Kp = 15,
+	                              t.min = 0, t.max = 1, 
+	                              standardized = TRUE)
+	
+	
+		trials = unique(test$trial)
+		for(i in 1:length(trials)){
+		  bicep = filter(test, trial == trials[i])$bicep * fconc_results$beta.pm$bicep
+      tricep = filter(test, trial == trials[i])$tricep * fconc_results$beta.pm$tricep
+      
+      xB_fconc[i,] = fconc_results$beta.pm$int + bicep + tricep
+		}
+		
+		predict_df$yhat_fconc = as.vector(t(xB_fconc))
+	
+	predict_df
+}# end function
+
+
+```
+
+Perform cross validation
+
+```{r}
+filename = here::here("output", "predict_fold_1.rds")
+
+if(file.exists(filename)){
+	print("not rerunning prediction")
+}else{
+  #predict_df = map_dfr(1:5, do_cv)
+  
+  for(fold in 1:10){
+    predict_df = do_cv(fold)
+    
+    f = paste0("predict_fold_", fold, ".rds")
+    saveRDS(predict_df, file = here::here("output", f))
+  }
+ }
+```
+
+
+
+load data from each fold and process into table and figure.
+
+```{r}
+
+f1 = readRDS(here::here("output", "predict_fold_1.rds"))
+f2 = readRDS(here::here("output", "predict_fold_2.rds"))
+f3 = readRDS(here::here("output", "predict_fold_3.rds"))
+f4 = readRDS(here::here("output", "predict_fold_4.rds"))
+f5 = readRDS(here::here("output", "predict_fold_5.rds"))
+f6 = readRDS(here::here("output", "predict_fold_6.rds"))
+f7 = readRDS(here::here("output", "predict_fold_7.rds"))
+f8 = readRDS(here::here("output", "predict_fold_8.rds"))
+f9 = readRDS(here::here("output", "predict_fold_9.rds"))
+f10 = readRDS(here::here("output", "predict_fold_10.rds"))
+
+
+df = bind_rows(f1, f2, f3, f4, f5, 
+               f6, f7, f8, f9, f10)
+
+
+saveRDS(df, file = here::here("output", "predict_fold_all.rds"))
+```
+
+
+
+The following table shows mean absoute error for each model. These numbers appear as MAE in the text of the paper.
+
+```{r}
+
+df %>%
+  pivot_longer(yhat_flode:yhat_fconc, names_to = "method", values_to = "yhat",
+               names_prefix = "yhat_") %>%
+  mutate(resid = value-yhat,
+         mse = resid^2,
+         mae = abs(resid)) %>%
+  group_by(method) %>%
+  summarize(mae = mean(mae)) %>%
+  ungroup() %>%
+  arrange(mae) %>%
+  knitr::kable(digits = 3)
+
+```
+
+
+# Bootstrap
+
+Get bootstrap confidence intervals for $\beta(t)$. 
+
+## Generate bootstrap samples
+
+First, generate bootstrap sample of the full data.
+
+```{r}
+# set up the folds
+set.seed(22334)
+reseg = reseg %>%
+  select(trial, int, time, value, bicep, tricep, y0) %>%
+  nest(data = c(-trial))
+
+
+reseg_boot <- bootstraps(reseg,
+                          times = 1000)
+```
+
+For our inference procedure, we first fit `flode` to obtain an estimated value of $\alpha$, then generate $n_b$ bootstrap samples and refit flode to obtain bootstrap estimates for the rest of the parameters.
+
+```{r}
+# load full model
+filename = here::here("output", "pUp_results.RData")
+load(filename)
+
+bootname = here::here("output", "pUp_results_boot.rda")
+
+if(file.exists(bootname)){
+	load(bootname)
+}else{
+  reseg_betas <- reseg_boot %>%
+  mutate(beta = map(splits, ~predict_flode(flode_model = pUp_results,
+                                            new_data = .,
+                                            forcing_functions = c("int",  "bicep", "tricep"),
+                                            boot = TRUE) )
+         )
+
+
+ save(reseg_betas, file = bootname)
+ }
+
+```
+
+
+Using our bootstrapped estimates, we create confidence intervals for the coefficient functions. We then plot the coefficient function and 95% confidence intervals and sae this plot as `flode_coefs_plot.Rda`. This plot is further modified in the `202311_dataAnalysis_steps.Rmd` file and becomes part of Figure 5 in the manuscript.
+
+```{r}
+
+beta_full = pUp_results$beta %>%
+  pivot_longer(beta0:beta2, names_to = "coef", values_to = "value") %>% filter(coef != "beta0")
+
+reseg_betas_pl = reseg_betas %>%
+  unnest(beta) %>%
+  select(-beta0) %>%
+  pivot_longer(beta1:beta2, names_to = "coef", values_to = "value") %>%
+  group_by(time, coef) %>%
+  summarize(sd = sd(value)) %>%
+  ungroup() %>%
+  mutate(beta_hat = beta_full$value,
+         lower = beta_hat - 2 * sd,
+         upper = beta_hat + 2 * sd) %>%
+    mutate(coef = factor(coef, levels = c("beta2", "beta1"), 
+                       labels = c("beta[triceps](t)", "beta[biceps](t)"))) 
+
+flode_coefs_plot = reseg_betas_pl %>%
+  ggplot() +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_line(aes(time, lower), linetype = 2) +
+  geom_line(aes(time, upper), linetype = 2) +
+  geom_line(aes(time, beta_hat)) +
+  labs(y = "value") +
+  theme(strip.text = element_text(size = 14)) +
+  facet_wrap(~coef, scales = "free",
+             labeller = label_parsed)
+
+save(flode_coefs_plot, file = here::here("output", "flode_coefs_plot.Rda"))
+```
+

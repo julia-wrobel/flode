@@ -1,0 +1,522 @@
+---
+title: "Data analysis figures and results"
+author: "Julia Wrobel"
+date: '`r format(Sys.time(), "%Y-%m-%d")`'
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+hitheme: tomorrow
+highlighter: highlight.js
+---
+
+# Overview
+
+This file loads produces figures and runs analysis for the motivating data. First we load libraries and source files for estimating the flode model.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(stringr)
+library(viridis)
+library(splines)
+library(refund)
+library(Matrix)
+library(mvtnorm)
+library(patchwork)
+library(pracma)
+library(tictoc)
+library(vbvs.concurrent) # devtools::install_github("jeff-goldsmith/vbvs.concurrent")
+library(fields)
+
+knitr::opts_chunk$set(echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 4,
+  fig.path = '../output/'
+)
+
+theme_set(theme_bw() + theme(legend.position = "bottom"))
+
+source(here::here("preprocessing", "estimate_flode.R"))
+source(here::here("preprocessing", "utils.R"))
+source(here::here("preprocessing", "search_alpha.R"))
+```
+
+# Load data
+
+Next we load the cleaned data.
+
+```{r data_import}
+load(here::here("data", "20231012_tidied_steps.RDA"))
+```
+
+
+
+# Analysis
+
+
+
+## data organization
+
+For our analysis we focused on running the model on the up (`p_up`) direction, so we clean the data and focus on that variable.
+
+
+```{r}
+reseg = reseg %>%
+  mutate(int = 1) %>%
+  nest(data = c(-step)) %>%
+  mutate(trial = row_number()) %>% 
+  unnest(data) %>%
+  select(trial, int, time = index, 
+         value = p_up, v_up, bicep, tricep) %>%
+  group_by(trial) %>%
+  mutate(y0 = first(value))  %>%
+  ungroup() 
+  
+
+```
+
+
+
+## Modeling
+
+First we do a grid search to find the best initial value of $\alpha$. For the grid search we run the model without random effects, choosing a particular value of $\alpha$ and using the observed initial positions to calculate the value of the loss function at that particular $\alpha$.
+
+To reduce computation time, we run flode on the data and save flode data object. The code below only runs the flode analysis if the saved `pUp_results.RData` object doesn't already exist in the `output` folder.
+
+
+### flode
+
+
+```{r loss}
+	alpha_start_pUp = search_alpha(data = reseg, 
+														 forcing_functions = c("int",  "bicep", "tricep"),
+														 Kt = 20, 
+														 alpha_min = 0,
+														 alpha_max = 20)
+```
+
+
+```{r pUp}
+filename = here::here("output", "pUp_results.RData")
+
+if(file.exists(filename)){
+	load(filename)
+}else{
+	tic()
+	# initiate alpha
+	alpha_start_pUp = search_alpha(data = reseg, 
+														 forcing_functions = c("int",  "bicep", "tricep"),
+														 Kt = 20, 
+														 alpha_min = 0,
+														 alpha_max = 6)
+	
+	# run flode
+	pUp_results = estimate_flode(reseg, 
+															alpha0 = alpha_start_pUp$best_alpha, 
+                            	Kt = 20,
+															forcing_functions = c("int", "bicep","tricep"),
+															max_iter = 50, 
+															tol = 0.001, 
+															initial_position = TRUE,
+															random_effects = TRUE,
+															alpha_upper = 6)
+	time_pUp = toc()
+
+	save(pUp_results, time_pUp, alpha_start_pUp, file = filename)
+}
+
+
+```
+
+
+### fhist
+
+Next we perform analysis using the functional historical model (fhist).
+
+
+```{r fhist}
+filename = here::here("output", "pUp_fhist.RData")
+
+
+if(file.exists(filename)){
+	load(filename)
+}else{
+  source(here::here("preprocessing", "make_pffr_pup.R"))
+	tic(quiet = TRUE)
+	pUp_fhist = make_pffr_pUp(reseg, covar = c("bicep","tricep"),
+	                      random_int = TRUE)
+	time_fhist = toc()
+
+
+	save(pUp_fhist, time_fhist, file = filename)
+}
+
+```
+
+
+### functional concurrent model
+
+Finally, we perform analysis using the functional linear concurrent model (fconc).
+
+```{r fconc}
+filename = here::here("output", "pUp_fconc.RData")
+
+if(file.exists(filename)){
+	load(filename)
+}else{
+
+	tic(quiet = TRUE)
+	pUp_fconc = vb_concurrent(value ~ int + bicep + tricep | time, 
+	                          id.var = "trial",
+                            data = reseg, 
+	                          Kt = 20,
+	                          Kp = 15,
+                            t.min = 0, t.max = 1, 
+                            standardized = TRUE)
+	time_fconc = toc()
+
+
+	save(pUp_fconc, time_fconc, file = filename)
+}
+
+
+```
+
+
+
+# Results
+
+
+
+## Data summary
+
+* Number of trials is `r length(unique(reseg$trial))`
+* Length of each trial is `r length(unique(reseg$time))`
+* alpha is `r pUp_results$alpha`
+
+
+## Computation times
+
+* flode is `r (time_pUp$toc - time_pUp$tic)/60` minutes 
+* functional historical model is `r (time_fhist$toc - time_fhist$tic)/60` minutes
+* functional concurrent model is `r (time_fconc$toc - time_fconc$tic)` seconds
+
+
+## Data reorg
+
+Here we do some processing on the objects returned from the three models (flode, fhist, fconc) to calculate quantities used for comparing results across models and for modeling.
+
+```{r}
+fhist_df = pUp_fhist$fhist_df
+pUp_fhist = pUp_fhist$mod
+
+
+source(here::here("preprocessing", "simulated_paw.R"))
+intercept_surface = make_sim_surface(alpha = pUp_results$alpha, 
+                                     beta = pUp_results$beta$beta0, 
+                                     D = 100, t_max = 1)
+
+# beta coefficients (doesn't include alpha term)
+beta_df = pUp_results$beta %>%
+  rename(bicep_flode = beta1,
+         tricep_flode = beta2) %>%
+  mutate(beta0_flode = as.numeric(rowSums(intercept_surface))/100,
+         beta0_fconc = pUp_fconc$beta.pm$int,
+         bicep_fconc = pUp_fconc$beta.pm$bicep,
+         tricep_fconc = pUp_fconc$beta.pm$tricep,
+         beta0_fhist = as.numeric(coef(pUp_fhist, n1 = 100, n2 = 100)$smterms$"Intercept(t)"$coef$value),
+         bicep_fhist = NA,
+         tricep_fhist = NA) %>%
+  select(time, everything())
+ 
+
+
+# beta surfaces (includes alpha term)
+make_surface_flode = function(data, beta_num){
+  surface = data$surface[[beta_num]]
+  surface %>% as_tibble() %>%
+    mutate(t = attributes(surface)$t) %>%
+    gather(s, value, starts_with("s")) %>%
+    arrange(t) %>%
+    mutate(s = rep(attributes(surface)$s, dim(data$surface[[1]])[1]),
+           label = paste0("beta", beta_num - 1))
+}
+
+surface_flode = map_dfr(2:3, make_surface_flode, data = pUp_results)
+
+# fhist surfaces
+make_surface_fhist = function(fhist_surf, D = 100, label){
+		## interpolate surface to get on same grid as flode
+		interp_obj = list(x = unique(fhist_surf$s), y = unique(fhist_surf$t),
+											z = matrix(fhist_surf$value, D, D, byrow = TRUE))
+		
+		t = s = seq(0, 1, length.out = D)
+		loc_mat = list(x = s, y = t)
+		surface = fields::interp.surface.grid(interp_obj, loc_mat)$z
+		surface[D,] = surface[D-1,] # carry last value forward so not NA
+		surface =	surface * lower.tri(surface, diag = TRUE) %>% as_tibble() 
+
+
+		surface %>% 
+		  mutate(t = t) %>%
+		  pivot_longer(V1:V100, names_to = "s", values_to = "value") %>%
+		  mutate(label = label,
+		         s = rep(seq(0, 1, length.out = D), 100)) 
+
+}
+
+fhist_surf1 = coef(pUp_fhist, n1 = 100, n2 = 100)$smterms$"ff(x1,s)"$coef %>%
+  select(s = x1.smat, t = x1.tmat, value = value) %>% as_tibble() 
+
+fhist_surf2 = coef(pUp_fhist, n1 = 100, n2 = 100)$smterms$"ff(x2,s)"$coef %>%
+  select(s = x2.smat, t = x2.tmat, value = value) %>% as_tibble() 
+
+		
+surface_fhist = bind_rows(make_surface_fhist(fhist_surf1, label = "bicep_fhist"),
+                          make_surface_fhist(fhist_surf2, label = "tricep_fhist")) %>%
+  select(value_fhist = value)
+
+
+surface_flode = surface_flode %>%
+  mutate(label = ifelse(label == "beta1", "bicep","tricep"))
+
+
+surfaces = bind_cols(surface_flode, surface_fhist) %>%
+  pivot_longer(c(value, value_fhist), names_to = "model", values_to = "value") %>%
+  mutate(model = ifelse(model == "value", "flode", "fhist"))
+  
+```
+
+
+
+Now, get xB for the fhist model.
+
+
+```{r}
+integrate_surface = function(basis_time, surface, covar){
+  D = length(basis_time)
+  
+  beta_covar_f = function(s0, t0 = 1, basis_time, surface, covar){
+    filter(surface, s == s0, t == t0)$value * covar[which(basis_time == s0)] 
+  }
+  
+  Gstar = sapply(basis_time, FUN = function(t){cumtrapz(basis_time, beta_covar_f(basis_time, t, basis_time, surface,covar))[D,]})
+  return(t(Gstar))
+}
+
+pUp_fhist
+xB_fhist = matrix(NA, length(unique(reseg$trial)), 100)
+grid = sort(unique(reseg$time))
+surface_bicep = make_surface_fhist(fhist_surf1, label = "bicep_fhist")
+surface_tricep = make_surface_fhist(fhist_surf2, label = "tricep_fhist")
+b0 = coef(pUp_fhist)$pterms[1]
+for(i in unique(reseg$trial)){
+  bicep = filter(reseg, trial == i)$bicep
+  tricep = filter(reseg, trial == i)$tricep
+  xb_bicep = integrate_surface(grid, surface_bicep, covar = bicep) 
+  xb_tricep = integrate_surface(grid, surface_tricep, covar = tricep) 
+  
+  xB_fhist[i,] = b0 +beta_df$beta0_fhist +
+    xb_bicep + xb_tricep
+}
+
+rm(grid, surface_bicep, surface_tricep, i, xb_bicep, xb_tricep, bicep, tricep)
+```
+
+
+
+
+
+
+```{r}
+# fitted values, linear predictor without random effects, random effects 
+df_results = pUp_results$data %>% 
+  mutate(xB = pUp_results$xB,
+         lp_flode = xB + y0_star,
+         lp_fconc = pUp_fconc$fixef,# fixef for 
+         lp_fhist = as.vector(t(xB_fhist)),
+         yhat_fhist = as.vector(t(fitted(pUp_fhist))),
+         yhat_fconc = pUp_fconc$Yhat,
+         resid_flode = value - lp_flode,
+         resid_fconc = value - lp_fconc,
+         resid_fhist = value - lp_fhist) %>%
+  rename(yhat_flode = yhat)
+
+
+cv_df <- readRDS(df, file = here::here("output", "predict_fold_all.rds")) %>%
+  pivot_longer(yhat_flode:yhat_fconc, names_to = "method", values_to = "yhat",
+               names_prefix = "yhat_") %>%
+  mutate(resid = value-yhat,
+         mae = abs(resid)) %>%
+  group_by(time, method) %>%
+  summarize(mae = mean(mae)) %>%
+  ungroup() %>%
+  arrange(method, time)
+```
+
+
+
+
+
+
+```{r}
+rm(list=lsf.str())
+```
+
+
+## Plots
+
+### Figure 1
+
+This produces Figure 1 in the manuscript, and saves it to the `output` folder as `fig_steps-1.png`.
+
+
+```{r fig_steps, fig.height = 5.5, fig.width = 9}
+set.seed(32543)
+steps = sample(unique(reseg$trial), 5)
+reseg %>%
+  filter(trial %in% steps) %>%
+  pivot_longer(value:tricep, 
+               names_to = "var",
+               values_to = "value") %>%
+  mutate(var =  factor(var, levels = c("tricep", "bicep", 
+                                       "v_up", "value"),
+                       labels = c("triceps activity", 
+                                  "biceps activity", 
+                                  "velocity",
+                                  "position"))) %>%
+  ggplot(aes(time, value)) +
+  geom_line() +
+  facet_grid(var~trial, scales = "free_y", 
+             labeller = labeller(var = label_value,
+                                 trial = label_both)) +
+  theme(strip.text = element_text(size = 12), 
+        #strip.text = element_blank(1),
+        axis.title.x = element_blank()) #
+
+df = reseg %>%
+  mutate(trial = factor(trial)) %>%
+  pivot_longer(value:tricep, names_to = "var", values_to = "value") %>%
+  mutate(var =  factor(var, levels = c("tricep", "bicep", "v_up", "value"),
+                       labels = c("triceps activity", 
+                                  "biceps activity", "velocity",
+                                  "position")))
+
+```
+
+
+### Figure 5
+
+This produces Figure 5 in the manuscript, and saves it to the `output` folder as `fig_wald_boot-1.png`. The Figure is created by modifying a figure with flode coefficient functions and 95% confidence intervals called `flode_coefs_plot` that is created in the `202311_dataAnalysis_prediction.Rmd` file.
+
+
+```{r fig_wald_boot, fig.height = 5, fig.width = 10}
+load(file = here::here("output", "flode_coefs_plot.Rda"))
+
+
+p2 = df %>% 
+  ggplot(aes(time, value, group = trial)) + 
+  geom_line(alpha = 0.2) +
+  facet_wrap(~var, nrow = 1, scales = "free_y") + 
+  theme(strip.text = element_text(size = 14),
+        axis.title.x = element_blank())
+
+
+p2/flode_coefs_plot
+
+
+```
+
+
+
+
+# Supplement
+
+Here we provide code to reproduce the supplemental figures that use the real data.
+
+### Figure S5
+
+Surfaces plots for flode and fhist
+
+```{r}
+
+make_surface_df = function(data, beta_num, model = "flode", D = 100){
+  if(model == "flode"){
+      surface = data$surface[[beta_num]]
+  
+  
+  surface %>% as_tibble() %>%
+    mutate(t = seq(0,1, length.out = D)) %>%
+    gather(s, value, starts_with("s")) %>%
+    arrange(t) %>%
+    mutate(s = rep(seq(0,1, length.out = D), dim(data$surface[[1]])[1]),
+           label = paste0("beta", beta_num - 1),
+           model = model)
+  }
+  else if(model == "fhist"){
+     ## calculate surface for fhist
+    if(beta_num == 1){
+      fhist_surface = coef(data, n1 = D, n2 = D)$smterms$"ff(x1,s)"$coef %>%
+         select(s = x1.smat, t = x1.tmat, value = value) %>% 
+        as_tibble()
+        
+    }else if(beta_num == 2){
+      fhist_surface = coef(data, n1 = D, n2 = D)$smterms$"ff(x2,s)"$coef %>%
+         select(s = x2.smat, t = x2.tmat, value = value) %>% 
+        as_tibble()
+    }
+    
+    fhist_surface = fhist_surface %>%
+      select(t, s, value)
+  
+  ## interpolate surface to get on same grid as flode
+  interp_obj = list(x = unique(fhist_surface$s), y = unique(fhist_surface$t),
+                    z = matrix(fhist_surface$value, D, D, byrow = TRUE))
+  
+  tt = ss = seq(0, 1, length.out = D)
+  loc_mat = list(x = ss, y = tt)
+  fhist_surface = fields::interp.surface.grid(interp_obj, loc_mat)$z
+  fhist_surface[D,] = fhist_surface[D-1,] # carry last value forward so not NA
+  fhist_surface = fhist_surface * lower.tri(fhist_surface, diag = TRUE)# zero out upper triangle of the matrix
+  
+  colnames(fhist_surface) = paste0("s", ss)
+  fhist_surface = fhist_surface %>%
+    as_tibble() %>%
+    mutate(t = tt) %>% select(t, everything()) %>%
+    gather(s, value, starts_with("s")) %>%
+    arrange(t) %>%
+    mutate(s = rep(ss, D),
+           label = paste0("beta", beta_num),
+           model = model,
+           value = ifelse(s <= t, value, NA))
+  
+  fhist_surface
+  }
+}
+
+surface_df = map_dfr(2:3, make_surface_df, data = pUp_results)
+surface_df_fhist = map_dfr(1:2, make_surface_df, data = pUp_fhist, model = "fhist")
+
+surface_df = bind_rows(surface_df, surface_df_fhist)
+```
+
+Saved as `appendix_surfaces-1` in the `output` folder.
+
+
+```{r appendix_surfaces}
+
+surface_df %>%
+  mutate(coef = factor(label, levels = c("beta2", "beta1"), 
+                       labels = c("triceps", "biceps")),
+         value = ifelse(s>t, NA, value)) %>%
+  ggplot(aes(s, t)) + 
+  geom_tile(aes(fill = value, col = value)) + 
+  scale_fill_viridis_c() +
+  scale_colour_viridis_c() +
+  facet_grid(model ~ coef) +
+  theme(legend.position = "bottom")
+
+```

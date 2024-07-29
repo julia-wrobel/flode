@@ -1,0 +1,302 @@
+---
+title: "flode simulation results for supplement"
+author: "Julia Wrobel"
+date: '`r format(Sys.time(), "%Y-%m-%d")`'
+output:
+  html_document: 
+    code_folding: hide
+    toc: true
+    toc_float: true
+hitheme: tomorrow
+highlighter: highlight.js
+---
+
+# Overview
+
+This file loads data objects stored from simulations and creates Figures 1,3,4, and 6 from the web supplement. Libraries and code are sourced below.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(stringr)
+library(viridis)
+library(splines)
+library(refund)
+library(Matrix)
+library(mvtnorm)
+library(patchwork)
+library(pracma)
+library(latex2exp)
+#library(ggthemes)
+
+knitr::opts_chunk$set(echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 4,
+  fig.path = '../output/'
+)
+
+theme_set(theme_bw() + theme(legend.position = "bottom"))
+
+source(here::here("preprocessing", "simulated_paw_kalman.R"))
+source(here::here("preprocessing", "predict_flode.R"))
+source(here::here("preprocessing", "simulated_paw.R"))
+source(here::here("preprocessing", "make_pffr.R"))
+source(here::here("preprocessing", "estimate_flode.R"))
+source(here::here("preprocessing", "utils.R"))
+source(here::here("preprocessing", "search_alpha.R"))
+```
+
+
+### Computation times
+
+
+```{r}
+filename = here::here("output",
+                      "202312_simResultsComptime.RData")
+
+load(filename)
+
+
+
+filename = here::here("output",
+                      "202312_simResults.RData")
+load(filename)
+```
+
+
+## Supplemental Figure 1
+
+
+```{r appendix_compTimes, fig.height=4}
+p1 = df %>%
+  select(iter, contains("time"), alpha_true) %>%
+  pivot_longer(time_flode:time_fhist, names_to = "model", values_to = "time") %>%
+  mutate(time = time / 60,
+         model = str_remove(model, "time_")) %>%
+  filter(model != "fconc") %>%
+  ggplot(aes( x = factor(alpha_true),  y = log(time), 
+	            group = interaction(factor(alpha_true), model), 
+	            fill = model)) +
+	geom_boxplot() +
+  scale_fill_brewer(type = "div",palette = 5) +
+  #ylim(0, 30) +
+  theme(legend.position = c(.6, .8)) +
+  labs(x = TeX("True $\\alpha$"), y = "Computation time (log minutes)")
+
+
+p2 = df_miter %>%
+  group_by(alpha_true) %>%
+  summarize(maxiter = median(miter)) %>%
+  ungroup() %>%
+  mutate(alpha_true = factor(alpha_true)) %>%
+  ggplot(aes(group = NULL)) +
+  geom_point(aes(x = alpha_true, y = maxiter)) + 
+  geom_line(aes(x = as.numeric(alpha_true), y = maxiter)) +
+  labs(x = TeX("True $\\alpha$"), y = "Median number of EM iterations")
+
+
+p1 + p2
+```
+
+
+
+
+## Supplemental Figure 3
+
+Tuning of smoothing parameters.
+
+```{r}
+
+results_tuning = c()
+files = list.files(here::here("output", "simulation_results"), 
+									 pattern = "flode_tuning",
+									 full.names =  TRUE)
+
+for(f in 1:length(files)){
+	load(files[f])
+	results_tuning = rbind(results_tuning, as_tibble(results))
+}
+```
+
+
+
+and plots for beta est
+
+```{r}
+p_tune = results_tuning %>%
+  filter(alpha_true == 4) %>%
+  mutate(Kt = factor(Kt, labels = c("K = 10", "K = 20", "K = 40")),
+         alpha_true = str_c("alpha = ", alpha_true),
+         a = str_c("lambda = ", a)) %>%
+  ggplot(aes(Kt, y = surfaceErr_flode, 
+             fill = Kt)) +
+  geom_boxplot() +
+  scale_fill_brewer(type = "div",palette = 1) +
+  theme(legend.position = "none", strip.text = element_text(size = 14), axis.title.x = element_blank()) +
+  facet_wrap(~a) +
+  labs(y = "flode surface error") 
+
+```
+
+
+One data set where alpha =4, Kt = 40, a = 0.001
+
+```{r, cache = TRUE}
+simulated_data = simulate_flode(I = 100, 
+																		D = 50, 
+																		sigma_y0 = 5, 
+																		sigma = 0.1, 
+																		alpha = 4, 
+																		rand_int = TRUE, 
+																		lambda0 = 10,
+																		seed = 335)
+
+dat = simulated_data$data %>% mutate(int = 1)
+
+flode_results_a001 = estimate_flode(dat, 
+																	 Kt = 40, 
+																	 alpha0 = 4,  
+																	 max_iter = 200, 
+																	 forcing_functions = c("int", "x"),
+																	 tol =  0.00001, 
+																	 sigma_b = 20,
+																	 sigma_d = 20,
+																	 random_effects = TRUE,
+																	 initial_position = TRUE,
+																	 y0_vec = simulated_data$y0,
+																	 a = 0.001)
+	
+flode_results_a01 = estimate_flode(dat, 
+																	 Kt = 40, 
+																	 alpha0 = 4,  
+																	 max_iter = 200, 
+																	 forcing_functions = c("int", "x"),
+																	 tol =  0.00001, 
+																	 sigma_b = 20,
+																	 sigma_d = 20,
+																	 random_effects = TRUE,
+																	 initial_position = TRUE,
+																	 y0_vec = simulated_data$y0,
+																	 a = 0.01)
+```
+
+
+Further simulate scenarios for alpha =4, Kt = 40, both a values, and do
+
+
+```{r}
+ptune2 = simulated_data$coefficient_fns %>%
+  select(time, truth = beta1) %>%
+  mutate(a001 = flode_results_a001$beta$beta1,
+         a01 = flode_results_a01$beta$beta1) %>%
+  pivot_longer(truth:a01, names_to = "model", values_to = "beta1") %>%
+  mutate(model = factor(model, levels = c("truth", "a01", "a001"), 
+                        labels = c("truth", "lambda = 0.01", "lambda = 0.001"))) %>%
+  ggplot(aes(time, beta1, group = model, color = model, linetype = model)) +
+  geom_line(size = 1.25) +
+  labs(y = TeX("$\\beta_1(t)$")) +
+  theme(legend.position = c(.35, .2), legend.title = element_blank(), legend.text = element_text(size = 12))
+  
+```
+
+
+
+
+```{r appendix_tuning,   fig.width = 9, fig.height = 4}
+p_tune + ptune2
+```
+
+## Supplemental Figure 5
+
+Figure of alpha and beta results across different trials sizes (with)
+
+```{r}
+
+filename = here::here("output",
+                      "202401_simVaryN.RData")
+
+load(filename)
+```
+
+
+Plot the results in the same manner as Figure 3 in the paper
+
+```{r appendix_varyN, fig.height = 7}
+df_varyN %>%
+  mutate(alpha_bias = alpha_true - alpha_hat) %>%
+  select(iter, N, alpha_true, alpha_bias, ISEb0, ISEb1) %>%
+  pivot_longer(alpha_bias:ISEb1, names_to = "measure", 
+               values_to = "value") %>%
+  mutate(measure = factor(measure, 
+                          levels = c("alpha_bias", "ISEb0", "ISEb1"),
+                          labels = c("alpha-hat(alpha)", TeX("$\\int_t\\{\\beta_0(t)-\\hat{\\beta}_0(t)\\}dt$"), TeX("$\\int_t\\{\\beta_1(t)-\\hat{\\beta}_1(t)\\}dt$"))),
+         N = factor(N)) %>%
+  mutate(alpha = factor(alpha_true,
+                        levels = c(0.5, 4, 12),
+                        labels = c("alpha: 0.5", "alpha: 4",
+                                   "alpha: 12"))) %>%
+  ggplot(aes(N, value, group = N)) +
+  geom_violin() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(x = "N", y = "error") +
+  facet_grid(alpha~measure, scales = "free",
+             labeller = label_parsed)
+
+```
+
+
+
+## Supplemental Figure 6
+
+Shows results of doing prediction for simulations where data is generated from a kalman filter
+
+
+First do prediction
+ 
+```{r}
+filename_k = here::here("output",
+                      "202406_simResults_predictionKalman.RData")
+
+if(file.exists(filename_k)){
+	load(filename_k)
+}else{
+  filename = paste0("/Users/JWROBE8/onedrive/Data/flode/kalman")
+  files = list.files(filename, 
+                   full.names =  TRUE)
+   ## generate list of datasets
+  pred_df = simulate_kalman(I = 10000, 
+                                 D = 50, 
+                                 sigma = 0.1, 
+                                 rand_int = TRUE, 
+                                 lambda0 = 10,
+                                 seed = 2352352)
+
+	
+  df_pred_kalman = map_dfr(files, get_predictions_genKalman, new_data = pred_df)
+  
+  save(df_pred_kalman, file = filename_k)
+}
+```
+
+
+
+Plot the results
+
+```{r appendix_kalman,fig.width = 2, fig.height = 3}
+df_pred_kalman %>%
+  select(iter, contains("mae")) %>%
+  pivot_longer(flode_mae:fhist_mae, names_to = "model", 
+               values_to = "MAPE") %>%
+  mutate(model = str_remove(model, "_mae"),
+         logMAPE = log(log(MAPE)),
+         model = factor(model, levels = c("flode", "fhist"))) %>%
+  ggplot(aes(model, logMAPE, group = model, fill = model)) +
+  geom_boxplot() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "log MAPE") +
+  scale_fill_brewer(drop = FALSE, type = "div") 
+
+```
+
